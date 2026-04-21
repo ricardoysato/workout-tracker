@@ -11,6 +11,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   html, body { background: #0a0a0a; color: #f5f5f5; font-family: 'Inter Tight', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; min-height: 100vh; overscroll-behavior-y: none; }
@@ -160,6 +161,12 @@
 // ============================================================
 const STORAGE_KEY_SESSIONS = 'wt.sessions.v1';
 const STORAGE_KEY_SPLIT = 'wt.split.v1';
+const STORAGE_KEY_DRIVE = 'wt.drive.v1';
+
+// ===== Google Drive =====
+const GOOGLE_CLIENT_ID = '938630473365-qgdqlb2oq1th7c5s7acsda6uk6khmfen.apps.googleusercontent.com';
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/drive.file openid email';
+const DRIVE_FILE_NAME = 'workout-tracker.json';
 
 const DEFAULT_SPLIT = {
   order: ['push', 'pull', 'legs'],
@@ -207,6 +214,13 @@ const state = {
   split: DEFAULT_SPLIT,
   currentSession: null,
   editingDayKey: null,       // when view = edit, which day
+  drive: {
+    connected: false,
+    email: null,
+    token: null,
+    tokenExpiresAt: 0,
+    fileId: null,
+  },
 };
 
 function uid(prefix) { return prefix + '-' + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4); }
@@ -223,6 +237,16 @@ function loadData() {
     const sp = localStorage.getItem(STORAGE_KEY_SPLIT);
     if (sp) state.split = JSON.parse(sp);
   } catch (e) { console.error('load split', e); }
+  try {
+    const dr = localStorage.getItem(STORAGE_KEY_DRIVE);
+    if (dr) {
+      const parsed = JSON.parse(dr);
+      // Only restore persistent fields; token is volatile and may have expired
+      state.drive.email = parsed.email || null;
+      state.drive.fileId = parsed.fileId || null;
+      state.drive.connected = !!parsed.email;
+    }
+  } catch (e) { console.error('load drive', e); }
 }
 function saveSessions() {
   try { localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify(state.sessions)); }
@@ -231,6 +255,14 @@ function saveSessions() {
 function saveSplit() {
   try { localStorage.setItem(STORAGE_KEY_SPLIT, JSON.stringify(state.split)); }
   catch (e) { toast('Erro ao salvar'); console.error(e); }
+}
+function saveDriveState() {
+  try {
+    localStorage.setItem(STORAGE_KEY_DRIVE, JSON.stringify({
+      email: state.drive.email,
+      fileId: state.drive.fileId,
+    }));
+  } catch (e) { console.error('save drive', e); }
 }
 
 // ============================================================
@@ -318,6 +350,122 @@ function toast(msg) {
   document.body.appendChild(el);
   toastTimeout = setTimeout(() => el.remove(), 2200);
 }
+
+// ============================================================
+// GOOGLE DRIVE AUTH
+// ============================================================
+let tokenClient = null;
+
+function initGoogleClient() {
+  if (!window.google || !window.google.accounts) {
+    // GIS library hasn't loaded yet
+    return false;
+  }
+  if (tokenClient) return true;
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: GOOGLE_SCOPES,
+    callback: '', // Set per-request
+  });
+  return true;
+}
+
+// Request a fresh access token. Returns a promise that resolves to the token string.
+// If silent=true, tries to renew without user interaction; falls back to prompt on failure.
+function requestAccessToken({ silent = false } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!initGoogleClient()) {
+      reject(new Error('Google library not loaded yet'));
+      return;
+    }
+    tokenClient.callback = (resp) => {
+      if (resp.error) {
+        reject(new Error(resp.error));
+        return;
+      }
+      state.drive.token = resp.access_token;
+      // Google returns expires_in in seconds (typically 3600)
+      state.drive.tokenExpiresAt = Date.now() + (resp.expires_in * 1000) - 60000; // 1 min safety margin
+      resolve(resp.access_token);
+    };
+    try {
+      tokenClient.requestAccessToken({ prompt: silent ? '' : 'consent' });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// Get a valid token, requesting a new one if the current one is missing or expired.
+async function getValidToken() {
+  if (state.drive.token && Date.now() < state.drive.tokenExpiresAt) {
+    return state.drive.token;
+  }
+  // Try silent renewal first
+  try {
+    return await requestAccessToken({ silent: true });
+  } catch (e) {
+    // Fallback to interactive
+    return await requestAccessToken({ silent: false });
+  }
+}
+
+// Fetch the user's email via the userinfo endpoint (lightweight, no extra scope needed
+// since 'drive.file' doesn't include email; we add openid+email implicitly below).
+// Actually, drive.file alone doesn't give us email. We'll get it from the ID token
+// by adding openid email profile to the scope request. Simpler approach: use the
+// tokeninfo endpoint to get basic info, OR add email scope. We'll add email scope.
+async function fetchUserEmail(token) {
+  try {
+    const resp = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.email || null;
+  } catch (e) {
+    console.error('fetchUserEmail', e);
+    return null;
+  }
+}
+
+async function connectDrive() {
+  try {
+    if (!window.google || !window.google.accounts) {
+      toast('Biblioteca do Google ainda carregando, tente de novo');
+      return;
+    }
+    const token = await requestAccessToken({ silent: false });
+    const email = await fetchUserEmail(token);
+    state.drive.connected = true;
+    state.drive.email = email || 'conta Google';
+    saveDriveState();
+    toast('Conectado ao Drive');
+    render();
+  } catch (err) {
+    console.error('connectDrive', err);
+    toast('Erro ao conectar: ' + (err.message || 'desconhecido'));
+  }
+}
+
+function disconnectDrive() {
+  if (!confirm('Desconectar do Google Drive?\n\nOs dados locais permanecem salvos no telefone.')) return;
+  // Revoke the token if we have one
+  if (state.drive.token) {
+    try { google.accounts.oauth2.revoke(state.drive.token, () => {}); } catch (e) {}
+  }
+  state.drive.connected = false;
+  state.drive.email = null;
+  state.drive.token = null;
+  state.drive.tokenExpiresAt = 0;
+  state.drive.fileId = null;
+  localStorage.removeItem(STORAGE_KEY_DRIVE);
+  toast('Desconectado');
+  render();
+}
+
+// Expose for later phases
+window._drive = { requestAccessToken, getValidToken };
 
 // ============================================================
 // RENDER ROUTER
@@ -621,6 +769,24 @@ function renderHistory(root) {
 // SETTINGS VIEW
 // ============================================================
 function renderSettings(root) {
+  const driveSection = state.drive.connected ? `
+    <button class="settings-item" data-action="disconnect-drive">
+      <div>
+        <div class="settings-item-label" style="color:#2a9d8f">● Google Drive conectado</div>
+        <div class="settings-item-sub">${escapeHtml(state.drive.email || '')}</div>
+      </div>
+      <span class="settings-item-arrow">${icons.arrow}</span>
+    </button>
+  ` : `
+    <button class="settings-item" data-action="connect-drive">
+      <div>
+        <div class="settings-item-label">Conectar Google Drive</div>
+        <div class="settings-item-sub">Sincronizar treinos entre dispositivos</div>
+      </div>
+      <span class="settings-item-arrow">${icons.arrow}</span>
+    </button>
+  `;
+
   root.innerHTML = `
     <div class="header">
       <button class="ghost-btn" data-action="back" aria-label="Voltar">${icons.back}</button>
@@ -628,7 +794,10 @@ function renderSettings(root) {
       <div style="width:38px"></div>
     </div>
 
-    <div class="section-label"><span>Treino</span></div>
+    <div class="section-label"><span>Sincronização</span></div>
+    ${driveSection}
+
+    <div class="section-label" style="margin-top:20px"><span>Treino</span></div>
     <button class="settings-item" data-action="edit">
       <div>
         <div class="settings-item-label">Editar exercícios</div>
@@ -672,6 +841,10 @@ function renderSettings(root) {
   root.querySelector('[data-action="import"]').addEventListener('click', () => root.querySelector('#import-file').click());
   root.querySelector('#import-file').addEventListener('change', importJSON);
   root.querySelector('[data-action="reset"]').addEventListener('click', resetAll);
+  const connectBtn = root.querySelector('[data-action="connect-drive"]');
+  if (connectBtn) connectBtn.addEventListener('click', connectDrive);
+  const disconnectBtn = root.querySelector('[data-action="disconnect-drive"]');
+  if (disconnectBtn) disconnectBtn.addEventListener('click', disconnectDrive);
 }
 
 function exportJSON() {
