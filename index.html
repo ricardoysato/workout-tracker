@@ -59,6 +59,10 @@
   /* Session */
   .session-day { font-size: 22px; font-weight: 800; letter-spacing: -0.02em; line-height: 1; }
   .session-progress { font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: rgba(245,245,245,0.5); margin-top: 4px; }
+  .session-date-wrap { position: relative; display: inline-block; margin-top: 6px; }
+  .session-date-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: rgba(245,245,245,0.55); padding: 4px 10px; border-radius: 6px; border: 1px solid rgba(245,245,245,0.1); background: rgba(245,245,245,0.03); font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
+  .session-date-label:active { background: rgba(245,245,245,0.08); }
+  .session-date-input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; border: none; background: transparent; }
   .finish-btn { display: flex; align-items: center; gap: 4px; padding: 10px 14px; border-radius: 10px; font-size: 13px; font-weight: 700; color: #0a0a0a; min-height: 38px; }
   .finish-btn:disabled { opacity: 0.35; }
   .progress-bar { height: 2px; background: rgba(245,245,245,0.06); border-radius: 2px; margin-bottom: 24px; overflow: hidden; }
@@ -241,6 +245,25 @@ function relativeDate(iso) {
   if (d.toDateString() === yesterday.toDateString()) return 'ontem';
   const diffDays = Math.floor((now - d) / (1000 * 60 * 60 * 24));
   if (diffDays < 7) return diffDays + 'd atrás';
+  return d.toLocaleDateString('pt-BR', { day: 'numeric', month: 'short' });
+}
+// Format an ISO date for an <input type="date"> value (local YYYY-MM-DD)
+function isoToInputDate(iso) {
+  const d = new Date(iso);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+// Friendly label for the session date picker
+function sessionDateLabel(iso) {
+  const d = new Date(iso);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return 'hoje';
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) return 'ontem';
+  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+  if (d.toDateString() === tomorrow.toDateString()) return 'amanhã';
   return d.toLocaleDateString('pt-BR', { day: 'numeric', month: 'short' });
 }
 function lastSessionOfDay(dayKey) {
@@ -456,6 +479,10 @@ function renderSession(root) {
       <div class="header-center">
         <div class="session-day" style="color:${accent}">${escapeHtml(sess.dayName)}</div>
         <div class="session-progress">${doneSets} / ${totalSets} séries</div>
+        <div class="session-date-wrap">
+          <label class="session-date-label" for="session-date-input">${sessionDateLabel(sess.date)}</label>
+          <input type="date" id="session-date-input" class="session-date-input" value="${isoToInputDate(sess.date)}" />
+        </div>
       </div>
       <button class="finish-btn" style="background:${accent}" data-action="finish" ${doneSets === 0 ? 'disabled' : ''}>
         ${icons.check} Fim
@@ -475,6 +502,20 @@ function renderSession(root) {
 
   root.querySelector('[data-action="cancel"]').addEventListener('click', cancelSession);
   root.querySelector('[data-action="finish"]').addEventListener('click', finishSession);
+
+  // Date picker: update session date, preserve time-of-day so history ordering stays stable
+  const dateInput = root.querySelector('#session-date-input');
+  if (dateInput) {
+    dateInput.addEventListener('change', e => {
+      const val = e.target.value; // "YYYY-MM-DD"
+      if (!val) return;
+      const [y, m, d] = val.split('-').map(Number);
+      const existing = new Date(state.currentSession.date);
+      existing.setFullYear(y, m - 1, d);
+      state.currentSession.date = existing.toISOString();
+      render();
+    });
+  }
   root.querySelectorAll('[data-action="toggle"]').forEach(btn => btn.addEventListener('click', () => {
     const exIdx = +btn.dataset.ex, setIdx = +btn.dataset.set;
     state.currentSession.exercises[exIdx].sets[setIdx].done = !state.currentSession.exercises[exIdx].sets[setIdx].done;
@@ -510,7 +551,9 @@ function finishSession() {
     toast('Nenhuma série completada');
     return;
   }
-  state.sessions.unshift(cleaned);
+  state.sessions.push(cleaned);
+  // Keep sessions sorted newest-first, so backdated sessions land in the right slot
+  state.sessions.sort((a, b) => new Date(b.date) - new Date(a.date));
   saveSessions();
   state.currentSession = null;
   state.view = 'home';
