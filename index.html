@@ -468,6 +468,163 @@ function disconnectDrive() {
 window._drive = { requestAccessToken, getValidToken };
 
 // ============================================================
+// GOOGLE DRIVE FILE OPERATIONS
+// ============================================================
+const DRIVE_API = 'https://www.googleapis.com/drive/v3';
+const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
+
+// Find our workout-tracker.json file if it exists. Returns file id or null.
+async function findDriveFile(token) {
+  const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}' and trashed=false`);
+  const resp = await fetch(`${DRIVE_API}/files?q=${q}&fields=files(id,name,modifiedTime)&spaces=drive`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) throw new Error(`Drive search failed (${resp.status})`);
+  const data = await resp.json();
+  if (data.files && data.files.length > 0) {
+    return data.files[0].id;
+  }
+  return null;
+}
+
+// Build the JSON payload of all local data
+function buildDrivePayload() {
+  return {
+    version: 1,
+    syncedAt: new Date().toISOString(),
+    split: state.split,
+    sessions: state.sessions,
+  };
+}
+
+// Create a new file on Drive with the given content. Returns new file id.
+async function createDriveFile(token, content) {
+  const metadata = { name: DRIVE_FILE_NAME, mimeType: 'application/json' };
+  const boundary = 'boundary_' + Math.random().toString(36).slice(2);
+  const body =
+    `--${boundary}\r\n` +
+    `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+    JSON.stringify(metadata) + `\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Type: application/json\r\n\r\n` +
+    JSON.stringify(content) + `\r\n` +
+    `--${boundary}--`;
+  const resp = await fetch(`${DRIVE_UPLOAD_API}/files?uploadType=multipart&fields=id`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': `multipart/related; boundary=${boundary}`,
+    },
+    body,
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Create failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
+  const data = await resp.json();
+  return data.id;
+}
+
+// Update an existing file on Drive with new content
+async function updateDriveFile(token, fileId, content) {
+  const resp = await fetch(`${DRIVE_UPLOAD_API}/files/${fileId}?uploadType=media`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(content),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Update failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
+  return true;
+}
+
+// Read the file content from Drive
+async function readDriveFile(token, fileId) {
+  const resp = await fetch(`${DRIVE_API}/files/${fileId}?alt=media`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Read failed (${resp.status}): ${text.slice(0, 200)}`);
+  }
+  return await resp.json();
+}
+
+// ===== High-level sync actions =====
+
+async function uploadToDrive() {
+  if (!state.drive.connected) {
+    toast('Conecte o Drive primeiro');
+    return;
+  }
+  toast('Enviando…');
+  try {
+    const token = await getValidToken();
+    const payload = buildDrivePayload();
+    // Always re-check for existing file (in case it was created from another device)
+    let fileId = state.drive.fileId;
+    if (!fileId) {
+      fileId = await findDriveFile(token);
+    }
+    if (fileId) {
+      await updateDriveFile(token, fileId, payload);
+    } else {
+      fileId = await createDriveFile(token, payload);
+    }
+    state.drive.fileId = fileId;
+    saveDriveState();
+    toast('Enviado pro Drive ✓');
+    render();
+  } catch (err) {
+    console.error('uploadToDrive', err);
+    toast('Erro ao enviar: ' + (err.message || 'desconhecido'));
+  }
+}
+
+async function downloadFromDrive() {
+  if (!state.drive.connected) {
+    toast('Conecte o Drive primeiro');
+    return;
+  }
+  toast('Baixando…');
+  try {
+    const token = await getValidToken();
+    let fileId = state.drive.fileId;
+    if (!fileId) {
+      fileId = await findDriveFile(token);
+    }
+    if (!fileId) {
+      toast('Nenhum arquivo no Drive ainda');
+      return;
+    }
+    const data = await readDriveFile(token, fileId);
+    if (!data.sessions || !data.split) {
+      throw new Error('Arquivo do Drive inválido');
+    }
+    const confirmMsg = `Baixar ${data.sessions.length} sessões do Drive?\n\nIsso vai substituir os dados atuais no telefone.`;
+    if (!confirm(confirmMsg)) {
+      toast('Cancelado');
+      return;
+    }
+    state.sessions = data.sessions;
+    state.split = data.split;
+    state.drive.fileId = fileId;
+    saveSessions();
+    saveSplit();
+    saveDriveState();
+    toast('Baixado do Drive ✓');
+    render();
+  } catch (err) {
+    console.error('downloadFromDrive', err);
+    toast('Erro ao baixar: ' + (err.message || 'desconhecido'));
+  }
+}
+
+// ============================================================
 // RENDER ROUTER
 // ============================================================
 function render() {
@@ -777,6 +934,20 @@ function renderSettings(root) {
       </div>
       <span class="settings-item-arrow">${icons.arrow}</span>
     </button>
+    <button class="settings-item" data-action="upload-drive">
+      <div>
+        <div class="settings-item-label">↑ Enviar pro Drive</div>
+        <div class="settings-item-sub">Salva dados atuais no Drive</div>
+      </div>
+      <span class="settings-item-arrow">${icons.arrow}</span>
+    </button>
+    <button class="settings-item" data-action="download-drive">
+      <div>
+        <div class="settings-item-label">↓ Baixar do Drive</div>
+        <div class="settings-item-sub">Substitui dados locais pelos do Drive</div>
+      </div>
+      <span class="settings-item-arrow">${icons.arrow}</span>
+    </button>
   ` : `
     <button class="settings-item" data-action="connect-drive">
       <div>
@@ -845,6 +1016,10 @@ function renderSettings(root) {
   if (connectBtn) connectBtn.addEventListener('click', connectDrive);
   const disconnectBtn = root.querySelector('[data-action="disconnect-drive"]');
   if (disconnectBtn) disconnectBtn.addEventListener('click', disconnectDrive);
+  const uploadBtn = root.querySelector('[data-action="upload-drive"]');
+  if (uploadBtn) uploadBtn.addEventListener('click', uploadToDrive);
+  const downloadBtn = root.querySelector('[data-action="download-drive"]');
+  if (downloadBtn) downloadBtn.addEventListener('click', downloadFromDrive);
 }
 
 function exportJSON() {
