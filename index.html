@@ -18,7 +18,7 @@
   input, button { font-family: inherit; color: inherit; }
   input { -webkit-appearance: none; appearance: none; }
   input:focus { outline: none; }
-  button { cursor: pointer; border: none; background: none; }
+  button { cursor: pointer; border: none; background: none; touch-action: manipulation; }
 
   .app { max-width: 520px; margin: 0 auto; padding: 20px 20px 60px; }
 
@@ -816,9 +816,18 @@ function renderEdit(root) {
   }));
   root.querySelectorAll('[data-action="add-ex"]').forEach(btn => btn.addEventListener('click', () => {
     const day = state.split.days[btn.dataset.day];
-    day.exercises.push({ id: uid('ex'), name: 'Novo exercício' });
+    const newId = uid('ex');
+    day.exercises.push({ id: newId, name: 'Novo exercício' });
     saveSplit();
     render();
+    // After re-render, focus the newly added input and select its placeholder text
+    setTimeout(() => {
+      const newInput = document.querySelector(`.edit-ex-input[data-id="${newId}"]`);
+      if (newInput) {
+        newInput.focus();
+        newInput.select();
+      }
+    }, 50);
   }));
 }
 
@@ -831,11 +840,6 @@ setTimeout(() => {
   document.getElementById('loading').style.display = 'none';
   render();
 }, 300);
-
-// Prevent iOS double-tap zoom on buttons
-document.addEventListener('touchend', e => {
-  if (e.target.tagName === 'BUTTON') e.preventDefault();
-}, { passive: false });
 </script>
 </body>
 </html>
