@@ -385,41 +385,60 @@ function initGoogleClient() {
 }
 
 // Request a fresh access token. Returns a promise that resolves to the token string.
-// If silent=true, tries to renew without user interaction; falls back to prompt on failure.
+// If silent=true, tries to renew without user interaction; rejects quickly on failure
+// so callers can decide whether to prompt the user.
 function requestAccessToken({ silent = false } = {}) {
   return new Promise((resolve, reject) => {
     if (!initGoogleClient()) {
       reject(new Error('Google library not loaded yet'));
       return;
     }
+    // Safety timeout: if the OAuth flow never calls back (e.g. silent renewal blocked
+    // by browser), reject after 10s so the UI doesn't get stuck in "syncing" forever.
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(silent ? 'Silent auth timeout' : 'Auth timeout'));
+    }, 10000);
+
     tokenClient.callback = (resp) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (resp.error) {
         reject(new Error(resp.error));
         return;
       }
       state.drive.token = resp.access_token;
-      // Google returns expires_in in seconds (typically 3600)
-      state.drive.tokenExpiresAt = Date.now() + (resp.expires_in * 1000) - 60000; // 1 min safety margin
+      state.drive.tokenExpiresAt = Date.now() + (resp.expires_in * 1000) - 60000;
       resolve(resp.access_token);
     };
     try {
-      tokenClient.requestAccessToken({ prompt: silent ? '' : 'consent' });
+      // For silent attempts, use prompt='none'. This only works if the user has
+      // recently granted consent and the browser allows it.
+      tokenClient.requestAccessToken({ prompt: silent ? 'none' : '' });
     } catch (err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       reject(err);
     }
   });
 }
 
-// Get a valid token, requesting a new one if the current one is missing or expired.
-async function getValidToken() {
+// Get a valid token. If we don't have one and `interactive` is false, fail fast
+// rather than hanging. Interactive calls will show the Google popup if needed.
+async function getValidToken({ interactive = true } = {}) {
   if (state.drive.token && Date.now() < state.drive.tokenExpiresAt) {
     return state.drive.token;
   }
-  // Try silent renewal first
+  // Try silent renewal first (quick and non-blocking)
   try {
     return await requestAccessToken({ silent: true });
   } catch (e) {
-    // Fallback to interactive
+    if (!interactive) throw e;
+    // Fallback to interactive (shows Google popup)
     return await requestAccessToken({ silent: false });
   }
 }
@@ -655,7 +674,9 @@ async function syncPullSilent() {
   if (!state.drive.connected) return;
   try {
     updateSyncStatus('syncing');
-    const token = await getValidToken();
+    // Non-interactive: don't show popup on boot. If silent auth fails, we'll
+    // try again interactively on the next user-triggered sync.
+    const token = await getValidToken({ interactive: false });
     let fileId = state.drive.fileId || await findDriveFile(token);
     if (!fileId) {
       // No file on Drive yet — push local data up as initial sync
@@ -678,7 +699,13 @@ async function syncPullSilent() {
     updateSyncStatus('synced');
   } catch (err) {
     console.error('syncPullSilent', err);
-    updateSyncStatus('error', err.message || 'Erro ao sincronizar');
+    // Silent auth failure is expected on some reloads; don't alarm the user.
+    // Fall back to idle so the next user-triggered sync can re-auth.
+    if (/timeout|auth|popup/i.test(err.message || '')) {
+      updateSyncStatus('idle');
+    } else {
+      updateSyncStatus('error', err.message || 'Erro ao sincronizar');
+    }
   }
 }
 
@@ -690,7 +717,9 @@ function syncPushDebounced() {
   updateSyncStatus('syncing');
   pushDebounceTimer = setTimeout(async () => {
     try {
-      const token = await getValidToken();
+      // User-triggered actions can use interactive auth if needed, but we try
+      // silent first to avoid popup interruptions.
+      const token = await getValidToken({ interactive: true });
       const payload = buildDrivePayload();
       let fileId = state.drive.fileId;
       if (!fileId) {
@@ -744,10 +773,10 @@ function renderHome(root) {
   const suggested = suggestedDayKey();
   const weekCount = state.sessions.filter(s => (today - new Date(s.date)) / 86400000 < 7).length;
 
-  // Sync indicator (only when Drive is connected)
-  const syncLabels = { idle: '', syncing: 'sincronizando', synced: 'sincronizado', error: 'erro ao sincronizar', offline: 'offline' };
+  // Sync indicator (only when Drive is connected). Clickable to force a sync.
+  const syncLabels = { idle: 'toque pra sincronizar', syncing: 'sincronizando…', synced: 'sincronizado', error: 'toque pra tentar de novo', offline: 'offline' };
   const syncHtml = state.drive.connected
-    ? `<div class="sync-inline" style="margin-top:6px"><span class="sync-dot ${state.sync.status}"></span>${syncLabels[state.sync.status] || ''}</div>`
+    ? `<button class="sync-inline" data-action="force-sync" style="margin-top:6px;background:transparent;padding:0;cursor:pointer"><span class="sync-dot ${state.sync.status}"></span>${syncLabels[state.sync.status] || ''}</button>`
     : '';
 
   const dayCards = state.split.order.map(key => {
@@ -800,6 +829,36 @@ function renderHome(root) {
   root.querySelectorAll('[data-action="start"]').forEach(btn => btn.addEventListener('click', () => startSession(btn.dataset.day)));
   root.querySelector('[data-action="history"]').addEventListener('click', () => { state.view = 'history'; render(); });
   root.querySelector('[data-action="settings"]').addEventListener('click', () => { state.view = 'settings'; render(); });
+  const forceSyncBtn = root.querySelector('[data-action="force-sync"]');
+  if (forceSyncBtn) forceSyncBtn.addEventListener('click', () => {
+    // Force a full pull-then-push cycle. Interactive auth if needed.
+    forceSyncNow();
+  });
+}
+
+// Manually triggered full sync. Shows popup if needed.
+async function forceSyncNow() {
+  if (!state.drive.connected) return;
+  updateSyncStatus('syncing');
+  try {
+    const token = await getValidToken({ interactive: true });
+    let fileId = state.drive.fileId || await findDriveFile(token);
+    if (fileId) {
+      const data = await readDriveFile(token, fileId);
+      if (data && data.sessions && data.split) {
+        state.sessions = data.sessions;
+        state.split = data.split;
+        saveSessions();
+        saveSplit();
+      }
+      state.drive.fileId = fileId;
+      saveDriveState();
+    }
+    updateSyncStatus('synced');
+  } catch (err) {
+    console.error('forceSyncNow', err);
+    updateSyncStatus('error', err.message || 'Erro');
+  }
 }
 
 // ============================================================
