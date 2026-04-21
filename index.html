@@ -385,22 +385,20 @@ function initGoogleClient() {
 }
 
 // Request a fresh access token. Returns a promise that resolves to the token string.
-// If silent=true, tries to renew without user interaction; rejects quickly on failure
-// so callers can decide whether to prompt the user.
-function requestAccessToken({ silent = false } = {}) {
+function requestAccessToken() {
   return new Promise((resolve, reject) => {
     if (!initGoogleClient()) {
       reject(new Error('Google library not loaded yet'));
       return;
     }
-    // Safety timeout: if the OAuth flow never calls back (e.g. silent renewal blocked
-    // by browser), reject after 10s so the UI doesn't get stuck in "syncing" forever.
     let settled = false;
+    // Safety timeout: if the OAuth flow never calls back, reject after 15s so
+    // the UI doesn't get stuck in "syncing" forever.
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      reject(new Error(silent ? 'Silent auth timeout' : 'Auth timeout'));
-    }, 10000);
+      reject(new Error('Auth timeout'));
+    }, 15000);
 
     tokenClient.callback = (resp) => {
       if (settled) return;
@@ -414,10 +412,16 @@ function requestAccessToken({ silent = false } = {}) {
       state.drive.tokenExpiresAt = Date.now() + (resp.expires_in * 1000) - 60000;
       resolve(resp.access_token);
     };
+    tokenClient.error_callback = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(err.type || err.message || 'Auth error'));
+    };
     try {
-      // For silent attempts, use prompt='none'. This only works if the user has
-      // recently granted consent and the browser allows it.
-      tokenClient.requestAccessToken({ prompt: silent ? 'none' : '' });
+      // Standard flow: browser decides whether to show popup based on user's
+      // current Google session. Works reliably in Safari iOS, unlike prompt='none'.
+      tokenClient.requestAccessToken({ prompt: '' });
     } catch (err) {
       if (settled) return;
       settled = true;
@@ -427,20 +431,12 @@ function requestAccessToken({ silent = false } = {}) {
   });
 }
 
-// Get a valid token. If we don't have one and `interactive` is false, fail fast
-// rather than hanging. Interactive calls will show the Google popup if needed.
-async function getValidToken({ interactive = true } = {}) {
+// Get a valid token, requesting a new one only if current is expired.
+async function getValidToken() {
   if (state.drive.token && Date.now() < state.drive.tokenExpiresAt) {
     return state.drive.token;
   }
-  // Try silent renewal first (quick and non-blocking)
-  try {
-    return await requestAccessToken({ silent: true });
-  } catch (e) {
-    if (!interactive) throw e;
-    // Fallback to interactive (shows Google popup)
-    return await requestAccessToken({ silent: false });
-  }
+  return await requestAccessToken();
 }
 
 // Fetch the user's email via the userinfo endpoint (lightweight, no extra scope needed
@@ -468,7 +464,7 @@ async function connectDrive() {
       toast('Biblioteca do Google ainda carregando, tente de novo');
       return;
     }
-    const token = await requestAccessToken({ silent: false });
+    const token = await requestAccessToken();
     const email = await fetchUserEmail(token);
     state.drive.connected = true;
     state.drive.email = email || 'conta Google';
@@ -669,14 +665,12 @@ function updateSyncStatus(status, error = null) {
   if (state.view === 'home' || state.view === 'settings') render();
 }
 
-// Silent pull on app open: if Drive file exists and is newer than local, replace local.
+// Silent pull on app open: if Drive file exists, replace local data with it.
 async function syncPullSilent() {
   if (!state.drive.connected) return;
   try {
     updateSyncStatus('syncing');
-    // Non-interactive: don't show popup on boot. If silent auth fails, we'll
-    // try again interactively on the next user-triggered sync.
-    const token = await getValidToken({ interactive: false });
+    const token = await getValidToken();
     let fileId = state.drive.fileId || await findDriveFile(token);
     if (!fileId) {
       // No file on Drive yet — push local data up as initial sync
@@ -699,13 +693,7 @@ async function syncPullSilent() {
     updateSyncStatus('synced');
   } catch (err) {
     console.error('syncPullSilent', err);
-    // Silent auth failure is expected on some reloads; don't alarm the user.
-    // Fall back to idle so the next user-triggered sync can re-auth.
-    if (/timeout|auth|popup/i.test(err.message || '')) {
-      updateSyncStatus('idle');
-    } else {
-      updateSyncStatus('error', err.message || 'Erro ao sincronizar');
-    }
+    updateSyncStatus('idle');
   }
 }
 
@@ -717,9 +705,7 @@ function syncPushDebounced() {
   updateSyncStatus('syncing');
   pushDebounceTimer = setTimeout(async () => {
     try {
-      // User-triggered actions can use interactive auth if needed, but we try
-      // silent first to avoid popup interruptions.
-      const token = await getValidToken({ interactive: true });
+      const token = await getValidToken();
       const payload = buildDrivePayload();
       let fileId = state.drive.fileId;
       if (!fileId) {
@@ -841,7 +827,7 @@ async function forceSyncNow() {
   if (!state.drive.connected) return;
   updateSyncStatus('syncing');
   try {
-    const token = await getValidToken({ interactive: true });
+    const token = await getValidToken();
     let fileId = state.drive.fileId || await findDriveFile(token);
     if (fileId) {
       const data = await readDriveFile(token, fileId);
